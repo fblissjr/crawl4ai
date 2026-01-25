@@ -249,6 +249,87 @@ def download_and_compress_images(
     return url_to_path
 
 
+def download_images_as_base64(
+    result,
+    quality: int = 80,
+    max_width: int = 800,
+    verbose: bool = False,
+) -> dict[str, str]:
+    """
+    Download images and return as base64 data URIs.
+
+    Args:
+        result: CrawlResult with media dict containing images
+        quality: JPEG quality 1-100
+        max_width: Resize images wider than this
+        verbose: Print progress
+
+    Returns:
+        dict mapping original URLs to base64 data URIs
+    """
+    import httpx
+
+    images = result.media.get("images", [])
+    if not images:
+        return {}
+
+    url_to_base64 = {}
+
+    with httpx.Client(timeout=10, follow_redirects=True) as client:
+        for img in images:
+            src = img.get("src", "")
+            if not src or not src.startswith("http"):
+                continue
+
+            try:
+                # Download
+                resp = client.get(src)
+                resp.raise_for_status()
+
+                # Compress
+                img_data = Image.open(BytesIO(resp.content))
+                if img_data.mode in ("RGBA", "P"):
+                    img_data = img_data.convert("RGB")
+
+                # Resize if needed
+                if max_width and img_data.width > max_width:
+                    ratio = max_width / img_data.width
+                    new_height = int(img_data.height * ratio)
+                    img_data = img_data.resize(
+                        (max_width, new_height), Image.Resampling.LANCZOS
+                    )
+
+                # Convert to base64
+                buffer = BytesIO()
+                img_data.save(buffer, "JPEG", quality=quality, optimize=True)
+                b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                url_to_base64[src] = f"data:image/jpeg;base64,{b64}"
+
+            except Exception:
+                # Skip failed downloads silently
+                continue
+
+    return url_to_base64
+
+
+def embed_images_in_markdown(markdown: str, url_to_base64: dict[str, str]) -> str:
+    """
+    Replace image URLs in markdown with base64 data URIs.
+
+    Args:
+        markdown: Markdown content with image URLs
+        url_to_base64: Mapping of URLs to base64 data URIs
+
+    Returns:
+        Markdown with embedded images
+    """
+    result = markdown
+    for url, data_uri in url_to_base64.items():
+        # Replace both markdown image syntax and raw URLs
+        result = result.replace(url, data_uri)
+    return result
+
+
 def extract_metadata(result, url: str) -> dict:
     """
     Extract article metadata as a dictionary.
@@ -426,10 +507,15 @@ def save_mhtml(result, output_path: Path) -> None:
     help="Download and compress images locally (for markdown mode)",
 )
 @click.option(
+    "--embed-images",
+    is_flag=True,
+    help="Embed images as base64 in markdown (self-contained for LLMs)",
+)
+@click.option(
     "--image-width",
     default=800,
     type=int,
-    help="Max width for downloaded images",
+    help="Max width for downloaded/embedded images",
 )
 def main(
     url: str,
@@ -447,6 +533,7 @@ def main(
     screenshot_quality: int,
     screenshot_width: Optional[int],
     download_images: bool,
+    embed_images: bool,
     image_width: int,
 ):
     """
@@ -535,8 +622,29 @@ def main(
         elif mode == "markdown":
             content, references = extract_full_markdown(result)
 
-            # Optionally download and compress images
-            if download_images:
+            # Embed images as base64 (self-contained markdown for LLMs)
+            if embed_images:
+                if verbose:
+                    console.print("[dim]Downloading and embedding images...[/dim]")
+                url_to_base64 = download_images_as_base64(
+                    result,
+                    quality=screenshot_quality,
+                    max_width=image_width,
+                )
+                if url_to_base64:
+                    content = embed_images_in_markdown(content, url_to_base64)
+                    if references:
+                        references = embed_images_in_markdown(references, url_to_base64)
+                    # Calculate embedded size
+                    total_b64_size = sum(len(b64) for b64 in url_to_base64.values())
+                    if verbose:
+                        console.print(
+                            f"[green]Embedded:[/green] {len(url_to_base64)} images "
+                            f"(~{total_b64_size // 1024}KB base64)"
+                        )
+
+            # Optionally download and compress images to files
+            elif download_images:
                 images_dir = output_dir / f"{page_slug}_images"
                 url_to_path = download_and_compress_images(
                     result, images_dir,

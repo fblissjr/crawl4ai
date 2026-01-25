@@ -8,6 +8,7 @@
 .env
 .env.local
 .claude/*
+output/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
