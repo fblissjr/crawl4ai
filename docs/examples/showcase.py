@@ -35,6 +35,7 @@ from crawl4ai import (
     PruningContentFilter,
     BFSDeepCrawlStrategy,
 )
+from crawl4ai.deep_crawling.filters import FilterChain, URLPatternFilter
 
 console = Console()
 
@@ -63,6 +64,8 @@ async def crawl_url(
     max_pages: int = 10,
     no_images: bool = False,
     image_quality: int = 2,
+    cache_mode_str: str = "bypass",
+    url_pattern: Optional[str] = None,
 ):
     """
     Core async crawl function.
@@ -111,14 +114,31 @@ async def crawl_url(
     # Configure deep crawl strategy if requested
     deep_crawl_strategy = None
     if deep:
+        # Build filter chain if URL pattern specified
+        filter_chain = None
+        if url_pattern:
+            filter_chain = FilterChain([
+                URLPatternFilter(patterns=[url_pattern])
+            ])
+
         deep_crawl_strategy = BFSDeepCrawlStrategy(
             max_depth=1,  # Seed page + 1 level of links
             include_external=False,  # Stay on same domain
             max_pages=max_pages,
+            filter_chain=filter_chain,
         )
 
+    # Map CLI cache mode string to CacheMode enum
+    cache_mode_map = {
+        "bypass": CacheMode.BYPASS,
+        "enabled": CacheMode.ENABLED,
+        "read-only": CacheMode.READ_ONLY,
+        "write-only": CacheMode.WRITE_ONLY,
+    }
+    cache_mode = cache_mode_map.get(cache_mode_str, CacheMode.BYPASS)
+
     crawler_config = CrawlerRunConfig(
-        cache_mode=CacheMode.BYPASS,
+        cache_mode=cache_mode,
         page_timeout=timeout * 1000,  # Convert to milliseconds
         screenshot=needs_screenshot,
         pdf=needs_pdf,
@@ -330,6 +350,106 @@ def embed_images_in_markdown(markdown: str, url_to_base64: dict[str, str]) -> st
     return result
 
 
+def extract_date_from_result(result) -> Optional[str]:
+    """
+    Extract a date from a crawl result using multiple strategies.
+
+    Tries in order:
+    1. Standard metadata fields (date, published, datePublished)
+    2. Open Graph article:published_time
+    3. Date patterns in the first 500 chars of markdown
+
+    Returns:
+        ISO date string (YYYY-MM-DD) or None if not found
+    """
+    from datetime import datetime
+    import re
+
+    # Strategy 1: Check metadata for common date fields
+    if result.metadata:
+        for key in ["date", "published", "datePublished", "article:published_time",
+                    "og:article:published_time", "pubdate", "publish_date"]:
+            if key in result.metadata and result.metadata[key]:
+                date_str = result.metadata[key]
+                # Try to parse ISO format
+                try:
+                    if "T" in date_str:
+                        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                        return dt.strftime("%Y-%m-%d")
+                    return date_str[:10]  # Assume YYYY-MM-DD prefix
+                except (ValueError, TypeError):
+                    pass
+
+    # Strategy 2: Look for date patterns in markdown content
+    if result.markdown:
+        # Get first 1000 chars where dates usually appear
+        text = str(result.markdown)[:1000]
+
+        # Common date patterns
+        patterns = [
+            # ISO: 2024-01-15
+            (r"(\d{4}-\d{2}-\d{2})", "%Y-%m-%d"),
+            # US: January 15, 2024 or Jan 15, 2024
+            (r"((?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})", None),
+            # UK: 15 January 2024
+            (r"(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})", None),
+        ]
+
+        for pattern, fmt in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                date_str = match.group(1)
+                if fmt:
+                    try:
+                        dt = datetime.strptime(date_str, fmt)
+                        return dt.strftime("%Y-%m-%d")
+                    except ValueError:
+                        pass
+                else:
+                    # Try dateutil for flexible parsing
+                    try:
+                        from dateutil import parser
+                        dt = parser.parse(date_str, fuzzy=True)
+                        return dt.strftime("%Y-%m-%d")
+                    except (ImportError, ValueError):
+                        # Fallback: manual parsing for common formats
+                        try:
+                            # Try "Month DD, YYYY" format
+                            dt = datetime.strptime(
+                                date_str.replace(",", ""),
+                                "%B %d %Y"
+                            )
+                            return dt.strftime("%Y-%m-%d")
+                        except ValueError:
+                            try:
+                                # Try abbreviated month
+                                dt = datetime.strptime(
+                                    date_str.replace(",", "").replace(".", ""),
+                                    "%b %d %Y"
+                                )
+                                return dt.strftime("%Y-%m-%d")
+                            except ValueError:
+                                pass
+
+    return None
+
+
+def sort_results_by_date(results: list, descending: bool = True) -> list:
+    """
+    Sort crawl results by extracted date.
+
+    Results without dates are placed at the end.
+    """
+    def get_sort_key(result):
+        date = extract_date_from_result(result)
+        # Results with no date go to the end
+        if date is None:
+            return ("9999-99-99" if descending else "0000-00-00", result.url)
+        return (date, result.url)
+
+    return sorted(results, key=get_sort_key, reverse=descending)
+
+
 def extract_metadata(result, url: str) -> dict:
     """
     Extract article metadata as a dictionary.
@@ -469,6 +589,12 @@ def save_mhtml(result, output_path: Path) -> None:
     help="Page timeout in seconds",
 )
 @click.option(
+    "--cache",
+    type=click.Choice(["bypass", "enabled", "read-only", "write-only"]),
+    default="bypass",
+    help="Cache mode: bypass (always fresh), enabled (use cache), read-only, write-only",
+)
+@click.option(
     "--deep",
     is_flag=True,
     help="Deep crawl: follow links 1 level deep",
@@ -477,6 +603,22 @@ def save_mhtml(result, output_path: Path) -> None:
     "--max-pages",
     default=10,
     help="Max pages to crawl in deep mode",
+)
+@click.option(
+    "--sort-by-date",
+    is_flag=True,
+    help="Sort results by date (newest first) before processing",
+)
+@click.option(
+    "--limit",
+    default=None,
+    type=int,
+    help="Limit output to N results (applied after sorting)",
+)
+@click.option(
+    "--url-pattern",
+    default=None,
+    help="Filter deep crawl URLs (glob pattern, e.g., '*garden*' or '*/essays/*')",
 )
 @click.option(
     "--no-images",
@@ -526,8 +668,12 @@ def main(
     no_headless: bool,
     verbose: bool,
     timeout: int,
+    cache: str,
     deep: bool,
     max_pages: int,
+    sort_by_date: bool,
+    limit: Optional[int],
+    url_pattern: Optional[str],
     no_images: bool,
     image_quality: int,
     screenshot_quality: int,
@@ -590,6 +736,8 @@ def main(
                 max_pages=max_pages,
                 no_images=no_images,
                 image_quality=image_quality,
+                cache_mode_str=cache,
+                url_pattern=url_pattern,
             )
         )
 
@@ -599,6 +747,33 @@ def main(
 
     if verbose and deep:
         console.print(f"[dim]Crawled {len(results)} pages[/dim]")
+
+    # Sort by date if requested
+    if sort_by_date and len(results) > 1:
+        if verbose:
+            console.print("[dim]Sorting by date (newest first)...[/dim]")
+        results = sort_results_by_date(results, descending=True)
+
+        # Show dates in verbose mode
+        if verbose:
+            for r in results[:5]:  # Show first 5
+                date = extract_date_from_result(r)
+                date_str = date if date else "no date"
+                console.print(f"  [dim]{date_str}: {r.url}[/dim]")
+            if len(results) > 5:
+                console.print(f"  [dim]... and {len(results) - 5} more[/dim]")
+
+    # Apply limit after sorting
+    if limit and len(results) > limit:
+        if verbose:
+            console.print(f"[dim]Limiting to {limit} results[/dim]")
+        results = results[:limit]
+
+    # Show cache status in verbose mode
+    if verbose and not deep:
+        cache_status = getattr(results[0], "cache_status", None) if results else None
+        if cache_status:
+            console.print(f"[dim]Cache: {cache_status}[/dim]")
 
     # Process each result
     output_dir.mkdir(parents=True, exist_ok=True)
