@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "c4md"
+version = "0.1.0"
+description = "Crawl4AI markdown extractor CLI"
+requires-python = ">=3.10"
+dependencies = [
+    "crawl4ai",
+    "click>=8.0",
+    "pillow>=10.0",
+    "rich>=13.0",
+    "httpx>=0.24",
+]
+
+[project.scripts]
+c4md = "c4md:main"
